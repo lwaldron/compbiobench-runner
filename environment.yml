@@ -55,6 +55,14 @@ dependencies:
   # File Format Utilities
   - htslib
 
+  # R / Bioconductor core (benchmark questions should prefer Bioconductor where
+  # possible). Kept lean on purpose: this is just enough for BiocManager to
+  # install packages at runtime. Promote frequently/slowly installed packages
+  # into this list based on real run traces rather than pre-loading a wishlist.
+  - r-base
+  - bioconductor-biocmanager
+  - bioconductor-biocversion
+
   # General Utilities
   - requests
   - tqdm

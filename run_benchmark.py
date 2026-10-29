@@ -939,11 +939,178 @@ class GeminiProvider(LLMProvider):
         raise NotImplementedError("answer extraction not implemented for gemini")
 
 
+class PiProvider(LLMProvider):
+    """pi coding-agent CLI provider (https://github.com/earendil-works/pi).
+
+    pi is provider-agnostic: a single harness reaches many proprietary and
+    open-weight models through ``--model provider/id`` (anthropic, openai,
+    google, openrouter, ...). List reachable models with ``pi --list-models``.
+
+    Run shape (verified against pi 1.4.0):
+      - ``--print --mode json`` emits newline-delimited JSON events on stdout.
+      - ``--no-extensions`` disables the permission-gating extension so built-in
+        read/bash/edit/write tools run unattended (pi core does not gate tools).
+      - ``--no-session`` keeps benchmark runs ephemeral.
+      - ``--thinking <level>`` is injected from --model-reasoning-effort in
+        build_llm_command (levels: off|minimal|low|medium|high|xhigh|max).
+
+    pi reports USD cost per message in message.usage.cost, so no pricing table
+    is maintained here; estimated cost mirrors pi's reported cost.
+    """
+
+    name = "pi"
+    # Levi currently has Claude and Gemini auth; the anthropic provider is gated
+    # behind Claude extra-usage, so default to a Gemini model that runs today.
+    # Override per run with -m, e.g. -m openrouter/meta-llama/llama-3.3-70b-instruct
+    default_model = "google/gemini-2.5-flash"
+    conda_env = "pi-cli"
+    install_url = "https://github.com/earendil-works/pi"
+
+    # pi reports its own USD cost; no hardcoded pricing table.
+    model_pricing: dict[str, object] = {}
+
+    def get_model_pricing(self, model: str) -> tuple[float, float]:
+        """pi reports cost directly; fall back to zero when unknown."""
+        pricing = self.model_pricing.get(model)
+        if isinstance(pricing, tuple):
+            return pricing
+        return (0.0, 0.0)
+
+    def build_test_command(self, model: str) -> list[str]:
+        """Build a minimal test command to verify model availability."""
+        return [
+            "pi", "--print", "--mode", "json", "--no-extensions", "--no-session",
+            "--thinking", "off", "--model", model, "--", "Reply with only the word OK",
+        ]
+
+    def build_command(self, model: str, prompt: str, data_dir: str | None = None, permission_mode: str = "skip",
+            workspace_dir: str = None, answer_output_path: str | None = None) -> list[str]:
+        # Tools run unattended via --no-extensions; the question runs in the
+        # process cwd (the workspace), so no explicit workdir flag is needed.
+        # --thinking <effort> is injected in build_llm_command.
+        cmd = [
+            "pi", "--print",
+            "--mode", "json",       # newline-delimited JSON event stream
+            "--no-extensions",       # disable permission gating; run tools unattended
+            "--no-session",          # ephemeral run
+            "--model", model,
+        ]
+        # "--" ends option parsing so a prompt beginning with "-" is safe.
+        cmd.extend(["--", prompt])
+        return cmd
+
+    def parse_output(self, stdout: str, model: str) -> tuple[str, dict]:
+        """Parse pi --mode json output (newline-delimited JSON events).
+
+        Events of interest are ``message_end`` with a ``message.role`` of
+        ``assistant`` (text + toolCall content blocks, plus usage) or
+        ``toolResult`` (tool output). ``message_update`` events are streaming
+        deltas and are skipped to avoid double counting.
+        """
+        usage = init_usage_dict(model, cache_creation_tokens=0, cache_read_tokens=0)
+        trace_parts: list[str] = []
+        final_answer = ""
+        total_cost = 0.0
+        input_tokens = output_tokens = cache_read = cache_write = 0
+
+        for event, _line in parse_jsonl_events(stdout):
+            event_type = event.get("type", "")
+            if event_type == "raw":
+                trace_parts.append(event["content"])
+                continue
+            if event_type != "message_end":
+                continue
+
+            message = event.get("message", {})
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content") or []
+
+            if role == "assistant":
+                u = message.get("usage", {}) or {}
+                input_tokens += int(u.get("input", 0) or 0)
+                output_tokens += int(u.get("output", 0) or 0)
+                cache_read += int(u.get("cacheRead", 0) or 0)
+                cache_write += int(u.get("cacheWrite", 0) or 0)
+                cost = u.get("cost", {})
+                if isinstance(cost, dict):
+                    total_cost += float(cost.get("total", 0) or 0)
+                if message.get("model"):
+                    usage["model"] = message["model"]
+
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text":
+                        text = block.get("text", "")
+                        msg = format_assistant_message("Pi", text)
+                        if msg:
+                            trace_parts.append(msg)
+                        if text.strip():
+                            final_answer = text
+                    elif block_type in ("toolCall", "tool_use"):
+                        tool_name = block.get("name", "")
+                        args = block.get("arguments", block.get("input", {})) or {}
+                        if tool_name == "bash":
+                            trace_parts.append(format_bash_tool(args.get("command", "")))
+                        elif tool_name in ("read", "write", "edit"):
+                            path = args.get("path", args.get("file_path", ""))
+                            trace_parts.append(format_tool_call(tool_name.capitalize(), path))
+                        else:
+                            trace_parts.append(format_tool_call(tool_name or "tool"))
+
+            elif role == "toolResult":
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        result = format_tool_result(block.get("text", ""))
+                        if result:
+                            trace_parts.append(result)
+
+        usage["input_tokens"] = input_tokens
+        usage["output_tokens"] = output_tokens
+        usage["cache_creation_tokens"] = cache_write
+        usage["cache_read_tokens"] = cache_read
+        # pi computes USD cost itself; mirror it as both reported and estimated.
+        reported = round(total_cost, 6)
+        if reported > 0:
+            usage["reported_cost_usd"] = reported
+            usage["cost_usd"] = reported
+        usage["estimated_cost_usd"] = usage["cost_usd"]
+
+        if final_answer and f"**Pi:** {final_answer.strip()}" not in trace_parts:
+            trace_parts.append(f"**Final Answer:**\n{final_answer.strip()}")
+
+        return build_trace_text(trace_parts, stdout), usage
+
+    def extract_answer(self, stdout: str, model: str, answer_output_path: str | None = None) -> str:
+        """Extract the final answer from pi's last assistant text block."""
+        saw_assistant_text = False
+        final_text = ""
+        for event, _line in parse_jsonl_events(stdout):
+            if event.get("type") != "message_end":
+                continue
+            message = event.get("message", {})
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for block in message.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                    saw_assistant_text = True
+                    final_text = block["text"]
+
+        answer = parse_answer(extract_last_non_empty_line(final_text))
+        if answer.startswith("ERROR:") and not saw_assistant_text:
+            return "ERROR: no assistant text"
+        return answer
+
+
 # Provider registry
 LLM_PROVIDERS: dict[str, LLMProvider] = {
     "claude": ClaudeProvider(),
     "codex": CodexProvider(),
     "gemini": GeminiProvider(),
+    "pi": PiProvider(),
 }
 
 
@@ -1003,6 +1170,7 @@ def generate_prompt(question: str, file_paths: str | None, workspace_file_paths:
         f"- You have {timeout_minutes} minutes to complete this task",
         "- Do not read/access any other files outside the workspace.",
         "- Get any files or tools you need from the internet.",
+        "- Prefer Bioconductor: whenever a Bioconductor or R package provides a suitable solution, use it in preference to other tools or languages. Install packages with BiocManager::install() when they are not already available.",
         "- You are free to modify the current conda environment as needed.",
         "- Keep all scripts and intermediate data in the workspace only.",
         "",
@@ -1070,6 +1238,9 @@ def build_llm_command(llm: str, model: str, prompt: str, data_dir: str | None = 
     if llm == "codex" and len(cmd) >= 2 and cmd[0] == "codex" and cmd[1] == "exec":
         assert model_reasoning_effort is not None
         cmd = cmd[:2] + ["-c", f"model_reasoning_effort={model_reasoning_effort}"] + cmd[2:]
+    if llm == "pi" and cmd and cmd[0] == "pi":
+        assert model_reasoning_effort is not None
+        cmd = cmd[:1] + ["--thinking", model_reasoning_effort] + cmd[1:]
 
     # Replace the CLI name with the full path to make it work inside cloned conda envs
     cli_path = get_cli_path(llm)
@@ -2286,7 +2457,7 @@ def main():
                    help="With --resume, remove each rerun question workspace before execution")
     p.add_argument("--keep-envs", action="store_true", help="Keep cloned conda envs after completion (for debugging)")
     p.add_argument("--model-reasoning-effort", required=True,
-                   help="Reasoning effort (Claude: low|medium|high|max; Codex: minimal|low|medium|high|xhigh)")
+                   help="Reasoning effort (Claude: low|medium|high|max; Codex: minimal|low|medium|high|xhigh; pi: off|minimal|low|medium|high|xhigh|max)")
     p.add_argument("--permission-mode", default="skip", choices=["default", "acceptEdits", "dontAsk", "skip"],
                    help="Permission mode: skip (bypass all, default), default (prompt), acceptEdits (auto-accept edits), dontAsk (auto-deny)")
     p.add_argument("--reverse", action="store_true", help="Run questions in reverse order")
@@ -2311,7 +2482,7 @@ def main():
                    help="With --resume, remove each rerun question workspace before execution")
     p.add_argument("--keep-envs", action="store_true", help="Keep cloned conda envs after completion")
     p.add_argument("--model-reasoning-effort", required=True,
-                   help="Reasoning effort (Claude: low|medium|high|max; Codex: minimal|low|medium|high|xhigh)")
+                   help="Reasoning effort (Claude: low|medium|high|max; Codex: minimal|low|medium|high|xhigh; pi: off|minimal|low|medium|high|xhigh|max)")
     p.add_argument("--permission-mode", default="skip", choices=["default", "acceptEdits", "dontAsk", "skip"],
                    help="Permission mode: skip (bypass all, default), default (prompt), acceptEdits (auto-accept edits), dontAsk (auto-deny)")
     p.add_argument("--reverse", action="store_true", help="Run questions in reverse order")
