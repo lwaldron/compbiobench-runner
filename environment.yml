@@ -1,5 +1,10 @@
 # Computational Biology Environment for Benchmark Questions
-# This environment provides common tools for bioinformatics analysis
+# This environment provides common tools for bioinformatics analysis.
+#
+# Target platform: linux-64 (where the benchmark runs). It also solves on most
+# conda platforms, but NOT osx-arm64: bioconda has no older cyvcf2 build for
+# Apple Silicon, and cooltools requires numpy<2 while current cyvcf2 requires
+# numpy>=2.2, so the two cannot coexist there. Run the benchmark on linux-64.
 name: compbio-benchmark
 channels:
   - conda-forge
@@ -11,13 +16,17 @@ dependencies:
   - pip
 
   # Data Analysis & Scientific Computing
-  - numpy
+  # numpy<2 is required: cooltools (below) has no numpy>=2 build, and leaving
+  # numpy unpinned pulls 2.x, which makes the whole env unsolvable.
+  - numpy <2
   - pandas
   - scipy
   - scikit-learn
 
   # Visualization
-  - matplotlib
+  # matplotlib-base (not the matplotlib meta) avoids pulling the pyqt/qt GUI
+  # stack, which is unneeded headless and conflicts during solving.
+  - matplotlib-base
   - seaborn
 
   # Bioinformatics - Core
