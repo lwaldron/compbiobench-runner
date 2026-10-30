@@ -60,7 +60,7 @@ dependencies:
   # install packages at runtime. Promote frequently/slowly installed packages
   # into this list based on real run traces rather than pre-loading a wishlist.
   - r-base
-  - bioconductor-biocmanager
+  - r-biocmanager
   - bioconductor-biocversion
 
   # General Utilities
